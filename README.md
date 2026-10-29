@@ -24,6 +24,8 @@ custom node fork are not required.
    the node's configured executable, or enter another executable's absolute path
    on each worker (inside the container when using Docker). No quotes or arguments
    are needed. A stock node can use a newer FFmpeg without modifying node code.
+   FFprobe is also required: by default the plugin uses the sibling executable
+   (`ffprobe` or `tdarr-ffprobe`). Set **FFprobe Path** if it is installed elsewhere.
 4. Connect **Input File → Remove Dolby Vision**. Output **1** is a new working
    file; connect it to your usual validation steps and **Replace Original File**.
    Output **2** means no Dolby Vision was detected. Output **3** means the file
@@ -33,6 +35,15 @@ custom node fork are not required.
 For an initial trial, use **Copy to Directory** on output 1 to inspect the result
 before enabling replacement. The plugin itself never overwrites the input.
 Allow cache space for one remuxed copy of the input file.
+
+Before reporting success, the plugin reads every packet in the input and output
+using FFprobe. It rejects scan errors, missing streams, changed codecs or HDR color
+tags, changed video/audio/subtitle packet counts, remaining Dolby Vision container
+signaling, and duration differences greater than 250 ms. This catches truncated
+files even when FFmpeg exits successfully. Validation adds two full file reads;
+it does not decode the entire video or compare every HDR10+ payload at runtime.
+The media tests perform those payload comparisons. Validation failures stop the
+flow with an error instead of returning a file on output 1.
 
 ## Supported video
 
@@ -66,6 +77,9 @@ fallback matched by stream index. MediaInfo must identify the Dolby Vision
 profile and compatible HDR format for that fallback. Filenames and PQ/BT.2020
 color tags alone are not treated as proof of a compatible Dolby Vision base.
 Rescan files if Tdarr has stale or incomplete metadata.
+Candidates for processing are scanned again before the remux; incompatible fresh
+metadata routes the unchanged file to output 3. Files lacking both Dolby Vision
+configuration records and identifying MediaInfo metadata can still go undetected.
 
 ## How HDR10+ is preserved
 
@@ -102,6 +116,9 @@ npm run test:flows -- --runInBand removeDolbyVision
 To also run the actual media preservation tests, set `TDARR_TEST_FFMPEG` and
 `TDARR_TEST_FFPROBE` to your executables before running that command. See the
 [test fixture provenance and instructions](tests/sampleData/media/dolbyVision/README.md).
+The dedicated media-test workflow runs the suite with Jellyfin FFmpeg/FFprobe
+**7.1.4-3**, matching Tdarr's Linux image checked on 2026-10-28. Both that build and
+FFmpeg **8.1.3** have passed the unit and media suite locally.
 
 The upstream plugin repository's general development instructions follow.
 

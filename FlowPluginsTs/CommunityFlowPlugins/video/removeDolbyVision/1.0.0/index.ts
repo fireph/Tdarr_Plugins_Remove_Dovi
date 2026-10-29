@@ -7,7 +7,7 @@ import {
   IpluginInputArgs,
   IpluginOutputArgs,
 } from '../../../../FlowHelpers/1.0.0/interfaces/interfaces';
-import { Istreams } from '../../../../FlowHelpers/1.0.0/interfaces/synced/IFileObject';
+import { IffProbeData, Istreams } from '../../../../FlowHelpers/1.0.0/interfaces/synced/IFileObject';
 
 const details = (): IpluginDetails => ({
   name: 'Remove Dolby Vision',
@@ -30,6 +30,15 @@ const details = (): IpluginDetails => ({
       inputUI: { type: 'text' },
       tooltip: 'Leave blank to use the node FFmpeg. Otherwise specify an executable path on the node'
         + ' (inside the container for Docker). No shell quoting or arguments.',
+    },
+    {
+      label: 'FFprobe Path',
+      name: 'ffprobePath',
+      type: 'string',
+      defaultValue: '',
+      inputUI: { type: 'text' },
+      tooltip: 'Leave blank to use ffprobe beside FFmpeg (including tdarr-ffprobe).'
+        + ' Set an explicit executable path if installed elsewhere. Used to fully scan input and output packets.',
     },
   ],
   outputs: [
@@ -107,6 +116,43 @@ const inspectVideo = (stream: Istreams, outputIndex: number, tracks: Metadata[])
   };
 };
 
+// Stream copy should retain every packet in each mapped track. Counting packets reads the whole
+// file without decoding it, and catches shortened output even when its header claims the original duration.
+const validateOutput = (input: IffProbeData, output: IffProbeData): void => {
+  const before = input.streams ?? [];
+  const after = output.streams ?? [];
+  if (before.length !== after.length) throw new Error('Output validation failed: stream count changed.');
+  before.forEach((stream, index) => {
+    const result = after[index];
+    const fail = (reason: string) => {
+      throw new Error(`Output validation failed for stream ${index}: ${reason}.`);
+    };
+    ['codec_type', 'codec_name', 'width', 'height', 'pix_fmt', 'color_transfer', 'color_primaries', 'color_space']
+      .forEach((key) => {
+        if (stream[key] !== undefined && stream[key] !== result[key]) fail(`${key} changed`);
+      });
+    if (['video', 'audio', 'subtitle'].includes(stream.codec_type)) {
+      // FFprobe reports N/A for an empty track, such as a subtitle track without cues.
+      const originalCount = asNumber(stream.nb_read_packets) ?? 0;
+      const resultCount = asNumber(result.nb_read_packets) ?? 0;
+      if (stream.codec_type === 'video' && originalCount === 0) fail('no input video packets');
+      if (originalCount !== resultCount) fail(`packet count changed (${originalCount} to ${resultCount})`);
+    }
+    if (result.codec_type === 'video' && inspectVideo(result, index, []).hasDovi) {
+      fail('Dolby Vision signaling remains');
+    }
+  });
+  const beforeDuration = asNumber(input.format?.duration);
+  const afterDuration = asNumber(output.format?.duration);
+  if (!beforeDuration || !afterDuration || beforeDuration < 0 || afterDuration < 0) {
+    throw new Error('Output validation failed: cannot confirm input/output duration.');
+  }
+  // Allow small container rounding differences, never a percentage of a potentially very long movie.
+  if (Math.abs(beforeDuration - afterDuration) > 0.25) {
+    throw new Error(`Output validation failed: duration changed (${beforeDuration}s to ${afterDuration}s).`);
+  }
+};
+
 const plugin = async (args: IpluginInputArgs): Promise<IpluginOutputArgs> => {
   const lib = require('../../../../../methods/lib')();
   const inputs = lib.loadDefaultValues(args.inputs, details);
@@ -115,14 +161,15 @@ const plugin = async (args: IpluginInputArgs): Promise<IpluginOutputArgs> => {
     outputNumber,
     variables: args.variables,
   });
-  const streams = args.inputFileObj.ffProbeData?.streams;
+  let streams = args.inputFileObj.ffProbeData?.streams;
   if (!Array.isArray(streams) || streams.length === 0) {
     throw new Error('Remove Dolby Vision requires FFprobe stream data. Rescan the file first.');
   }
   const mediaTracks: unknown[] = args.inputFileObj.mediaInfo?.track ?? [];
-  const videos = streams.map((stream, outputIndex) => inspectVideo(
+  const inspectStreams = (items: Istreams[]) => items.map((stream, outputIndex) => inspectVideo(
     stream, outputIndex, mediaTracks.filter(isMetadata),
   )).filter((video) => video.stream.codec_type === 'video' && video.hasDovi);
+  let videos = inspectStreams(streams);
 
   if (videos.length === 0) {
     args.jobLog('No Dolby Vision detected. Leaving the file unchanged.');
@@ -140,9 +187,14 @@ const plugin = async (args: IpluginInputArgs): Promise<IpluginOutputArgs> => {
 
   const ffmpegPath = String(inputs.ffmpegPath ?? '').trim() || args.ffmpegPath;
   if (!ffmpegPath) throw new Error('No FFmpeg executable configured.');
-  const run = async (spawnArgs: string[], outputFilePath = '') => {
+  const ffprobePath = String(inputs.ffprobePath ?? '').trim()
+    || path.join(path.dirname(ffmpegPath), path.basename(ffmpegPath).replace(/ffmpeg/i, 'ffprobe'));
+  if (ffprobePath === ffmpegPath) {
+    throw new Error('Cannot infer FFprobe executable from FFmpeg Path. Set the FFprobe Path input.');
+  }
+  const run = async (spawnArgs: string[], outputFilePath = '', executable = ffmpegPath) => {
     const cli = new CLI({
-      cli: ffmpegPath,
+      cli: executable,
       spawnArgs,
       spawnOpts: {},
       jobLog: args.jobLog,
@@ -154,10 +206,29 @@ const plugin = async (args: IpluginInputArgs): Promise<IpluginOutputArgs> => {
     });
     const result = await cli.runCli();
     if (cli.cancelled || result.cliExitCode !== 0) {
-      throw new Error(`Remove Dolby Vision: FFmpeg failed or was cancelled (exit ${result.cliExitCode}).`
+      const tool = executable === ffmpegPath ? 'FFmpeg' : 'FFprobe (check FFprobe Path)';
+      throw new Error(`Remove Dolby Vision: ${tool} failed or was cancelled (exit ${result.cliExitCode}).`
         + ' See the job log. The source file has not been replaced.');
     }
     return result;
+  };
+  const probe = async (file: string): Promise<IffProbeData> => {
+    const result = await run([
+      '-v', 'error', '-count_packets', '-show_streams', '-show_format', '-of', 'json', file,
+    ], '', ffprobePath);
+    let data: IffProbeData;
+    try {
+      // CLI collects both stdout and stderr. At log level error, anything outside the JSON is
+      // a read/parse error (even with exit 0), and must fail validation rather than be discarded.
+      data = JSON.parse(result.errorLogFull.join(''));
+    } catch (_) {
+      throw new Error('FFprobe validation failed: unreadable media or errors during the full packet scan.'
+        + ' See the job log.');
+    }
+    if (!data || !Array.isArray(data.streams) || data.streams.length === 0) {
+      throw new Error('FFprobe validation failed: no stream data returned.');
+    }
+    return data;
   };
 
   // Check actual capabilities, since vendors ship different FFmpeg builds under the same version.
@@ -170,6 +241,16 @@ const plugin = async (args: IpluginInputArgs): Promise<IpluginOutputArgs> => {
       + ' Configure FFmpeg 7.1+ using this plugin\'s FFmpeg Path input or the node settings.');
   }
 
+  args.jobLog('Scanning every input packet before removing Dolby Vision.');
+  const source = await probe(args.inputFileObj._id);
+  streams = source.streams ?? [];
+  videos = inspectStreams(streams);
+  if (videos.length === 0 || videos.some((video) => !video.hdr)) {
+    args.jobLog('Fresh FFprobe data does not confirm the expected compatible Dolby Vision tracks.'
+      + ' Rescan the file; leaving it unchanged and routing to output 3.');
+    return unchanged(3);
+  }
+
   const filename = path.basename(args.inputFileObj._id.replace(/\\/g, '/'));
   if (!path.extname(filename)) throw new Error('The input needs a container file extension.');
   const outputFilePath = path.join(getPluginWorkDir(args), filename);
@@ -177,7 +258,7 @@ const plugin = async (args: IpluginInputArgs): Promise<IpluginOutputArgs> => {
     throw new Error('The output path must differ from the input path.');
   }
   const cliArgs = [
-    '-hide_banner', '-nostdin', '-n', '-i', args.inputFileObj._id,
+    '-hide_banner', '-nostdin', '-n', '-xerror', '-i', args.inputFileObj._id,
     '-map', '0', '-map_metadata', '0', '-map_chapters', '0', '-c', 'copy',
   ];
   videos.forEach((video) => {
@@ -208,6 +289,8 @@ const plugin = async (args: IpluginInputArgs): Promise<IpluginOutputArgs> => {
   if (!output.isFile() || output.size === 0) {
     throw new Error('FFmpeg did not produce a non-empty output file.');
   }
+  args.jobLog('Scanning every output packet and checking stream, HDR color, packet count and duration preservation.');
+  validateOutput(source, await probe(outputFilePath));
   args.logOutcome('tSuc');
   return {
     outputFileObj: { _id: outputFilePath },

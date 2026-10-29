@@ -3,7 +3,8 @@ import { plugin } from
   '../../../../../../FlowPluginsTs/CommunityFlowPlugins/video/removeDolbyVision/1.0.0/index';
 import { CLI } from '../../../../../../FlowPluginsTs/FlowHelpers/1.0.0/cliUtils';
 import { IpluginInputArgs } from '../../../../../../FlowPluginsTs/FlowHelpers/1.0.0/interfaces/interfaces';
-import { Istreams } from '../../../../../../FlowPluginsTs/FlowHelpers/1.0.0/interfaces/synced/IFileObject';
+import { IffProbeData, Istreams } from
+  '../../../../../../FlowPluginsTs/FlowHelpers/1.0.0/interfaces/synced/IFileObject';
 
 jest.mock('../../../../../../FlowPluginsTs/FlowHelpers/1.0.0/cliUtils');
 
@@ -27,17 +28,49 @@ const video = (profile = 8, compatibility = 1, codec = 'hevc'): Istreams => ({
 describe('Remove Dolby Vision', () => {
   let args: IpluginInputArgs;
   let runCli: jest.Mock;
+  let inputProbe: IffProbeData | undefined;
+  let outputProbe: IffProbeData | undefined;
+  let probeError: string;
+  let probeExitCode: number;
+  let malformedProbe: boolean;
   let cancelled: boolean;
   const mockCLI = CLI as jest.MockedClass<typeof CLI>;
-  const command = (): string[] => mockCLI.mock.calls[1][0].spawnArgs;
+  const remux = () => {
+    const call = mockCLI.mock.calls.find(([config]) => config.spawnArgs.includes('-i'));
+    if (!call) throw new Error('Expected a remux command');
+    return call[0];
+  };
+  const command = (): string[] => remux().spawnArgs;
 
   beforeEach(() => {
     jest.clearAllMocks();
     cancelled = false;
+    inputProbe = undefined;
+    outputProbe = undefined;
+    probeError = '';
+    probeExitCode = 0;
+    malformedProbe = false;
     runCli = jest.fn().mockResolvedValue({ cliExitCode: 0, errorLogFull: [] })
       .mockResolvedValueOnce({ cliExitCode: 0, errorLogFull: ['Bitstream filters:\nfilter_units\ndovi_rpu\n'] });
-    mockCLI.mockImplementation(() => ({
-      runCli,
+    mockCLI.mockImplementation((config) => ({
+      runCli: config.spawnArgs.includes('-count_packets') ? jest.fn().mockImplementation(() => {
+        const source = inputProbe ?? {
+          streams: args.inputFileObj.ffProbeData.streams?.map((stream) => ({ ...stream, nb_read_packets: '259' })),
+          format: { duration: '10.798' },
+        };
+        const output = outputProbe ?? {
+          ...source,
+          streams: source.streams?.map((stream, index) => ({
+            ...stream, index, codec_tag_string: '', side_data_list: [],
+          })),
+        };
+        return Promise.resolve({
+          cliExitCode: probeExitCode,
+          errorLogFull: [probeError, malformedProbe ? '{' : JSON.stringify(
+            config.spawnArgs[config.spawnArgs.length - 1] === args.inputFileObj._id ? source : output,
+          )],
+        });
+      }) : runCli,
       get cancelled() { return cancelled; },
     } as unknown as CLI));
     jest.spyOn(fs, 'stat').mockResolvedValue({ size: 123, isFile: () => true } as Stats);
@@ -241,8 +274,8 @@ describe('Remove Dolby Vision', () => {
     args.inputs.ffmpegPath = '/opt/custom ffmpeg/ffmpeg';
     args.inputFileObj._id = '/media/Movie [DV] $HOME; \'quoted\'.mkv';
     await plugin(args);
-    expect(mockCLI.mock.calls[1][0].cli).toBe(args.inputs.ffmpegPath);
-    expect(mockCLI.mock.calls[1][0].spawnOpts).toEqual({});
+    expect(remux().cli).toBe(args.inputs.ffmpegPath);
+    expect(remux().spawnOpts).toEqual({});
     expect(command()[command().indexOf('-i') + 1]).toBe(args.inputFileObj._id);
   });
 
@@ -280,6 +313,102 @@ describe('Remove Dolby Vision', () => {
   it('does not report success on an empty output', async () => {
     jest.mocked(fs.stat).mockResolvedValue({ size: 0, isFile: () => true } as Stats);
     await expect(plugin(args)).rejects.toThrow('non-empty');
+    expect(args.logOutcome).not.toHaveBeenCalled();
+  });
+
+  it('fully scans input and output using the sibling Tdarr FFprobe before reporting success', async () => {
+    args.ffmpegPath = '/opt/tdarr/tdarr-ffmpeg';
+    const result = await plugin(args);
+    const probes = mockCLI.mock.calls.filter(([config]) => config.spawnArgs.includes('-count_packets'));
+    expect(probes).toHaveLength(2);
+    probes.forEach(([config]) => expect(config.cli).toBe('/opt/tdarr/tdarr-ffprobe'));
+    expect(probes[0][0].spawnArgs).toContain(args.inputFileObj._id);
+    expect(probes[1][0].spawnArgs).toContain(result.outputFileObj._id);
+    expect(command()).toContain('-xerror');
+  });
+
+  it('uses the explicit FFprobe path when FFmpeg has a custom name', async () => {
+    args.inputs.ffmpegPath = '/opt/media tool';
+    args.inputs.ffprobePath = '/opt/probe tool';
+    await plugin(args);
+    const probes = mockCLI.mock.calls.filter(([config]) => config.spawnArgs.includes('-count_packets'));
+    probes.forEach(([config]) => {
+      expect(config.cli).toBe('/opt/probe tool');
+      expect(config.spawnOpts).toEqual({});
+    });
+  });
+
+  it('requires an explicit FFprobe path when it cannot infer one', async () => {
+    args.inputs.ffmpegPath = '/opt/media-tool';
+    await expect(plugin(args)).rejects.toThrow('Set the FFprobe Path');
+    expect(mockCLI).not.toHaveBeenCalled();
+  });
+
+  it('rejects read errors even when FFprobe returns valid JSON and exit code zero', async () => {
+    probeError = '[matroska] File ended prematurely\n';
+    await expect(plugin(args)).rejects.toThrow('full packet scan');
+    expect(mockCLI.mock.calls.some(([config]) => config.spawnArgs.includes('-i'))).toBe(false);
+    expect(args.logOutcome).not.toHaveBeenCalled();
+  });
+
+  it('gives an actionable error when FFprobe cannot run', async () => {
+    probeExitCode = -1;
+    await expect(plugin(args)).rejects.toThrow('check FFprobe Path');
+    expect(args.logOutcome).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed probe data', async () => {
+    malformedProbe = true;
+    await expect(plugin(args)).rejects.toThrow('FFprobe validation failed');
+    expect(args.logOutcome).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing streams', { format: { duration: '10.798' } }, 'no stream data'],
+    ['missing track', { streams: [video(), video()] }, 'stream count changed'],
+    ['fewer packets despite unchanged header duration', {
+      streams: [{ ...video(), side_data_list: [], nb_read_packets: '135' }], format: { duration: '10.798' },
+    }, 'packet count changed'],
+    ['missing packet count', {
+      streams: [{ ...video(), side_data_list: [] }], format: { duration: '10.798' },
+    }, 'packet count changed'],
+    ['shorter duration despite equal packet counts', {
+      streams: [{ ...video(), side_data_list: [], nb_read_packets: '259' }], format: { duration: '5.627' },
+    }, 'duration changed'],
+    ['missing duration', { streams: [{ ...video(), side_data_list: [], nb_read_packets: '259' }] },
+      'cannot confirm'],
+    ['remaining Dolby Vision configuration', {
+      streams: [{ ...video(), nb_read_packets: '259' }], format: { duration: '10.798' },
+    }, 'Dolby Vision signaling remains'],
+    ['remaining Dolby Vision sample entry', {
+      streams: [{
+        ...video(), side_data_list: [], codec_tag_string: 'dvhe', nb_read_packets: '259',
+      }],
+      format: { duration: '10.798' },
+    }, 'Dolby Vision signaling remains'],
+    ['lost HDR transfer function', {
+      streams: [{
+        ...video(), side_data_list: [], color_transfer: 'bt709', nb_read_packets: '259',
+      }],
+      format: { duration: '10.798' },
+    }, 'color_transfer changed'],
+  ])('rejects output with %s after a successful remux exit', async (_label, data, error) => {
+    outputProbe = data as IffProbeData;
+    await expect(plugin(args)).rejects.toThrow(String(error));
+    expect(args.logOutcome).not.toHaveBeenCalled();
+  });
+
+  it('accepts small container duration rounding differences', async () => {
+    outputProbe = {
+      streams: [{ ...video(), side_data_list: [], nb_read_packets: '259' }], format: { duration: '10.799' },
+    };
+    expect((await plugin(args)).outputNumber).toBe(1);
+  });
+
+  it('uses fresh scan results to reject stale compatible-profile metadata', async () => {
+    inputProbe = { streams: [video(5, 0)], format: { duration: '10.798' } };
+    expect((await plugin(args)).outputNumber).toBe(3);
+    expect(mockCLI.mock.calls.some(([config]) => config.spawnArgs.includes('-i'))).toBe(false);
     expect(args.logOutcome).not.toHaveBeenCalled();
   });
 });

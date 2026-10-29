@@ -75,6 +75,15 @@ var details = function () { return ({
             tooltip: 'Leave blank to use the node FFmpeg. Otherwise specify an executable path on the node'
                 + ' (inside the container for Docker). No shell quoting or arguments.',
         },
+        {
+            label: 'FFprobe Path',
+            name: 'ffprobePath',
+            type: 'string',
+            defaultValue: '',
+            inputUI: { type: 'text' },
+            tooltip: 'Leave blank to use ffprobe beside FFmpeg (including tdarr-ffprobe).'
+                + ' Set an explicit executable path if installed elsewhere. Used to fully scan input and output packets.',
+        },
     ],
     outputs: [
         { number: 1, tooltip: 'Dolby Vision removed; output is a new working file' },
@@ -148,11 +157,53 @@ var inspectVideo = function (stream, outputIndex, tracks) {
         reason: reason,
     };
 };
+// Stream copy should retain every packet in each mapped track. Counting packets reads the whole
+// file without decoding it, and catches shortened output even when its header claims the original duration.
+var validateOutput = function (input, output) {
+    var _a, _b, _c, _d;
+    var before = (_a = input.streams) !== null && _a !== void 0 ? _a : [];
+    var after = (_b = output.streams) !== null && _b !== void 0 ? _b : [];
+    if (before.length !== after.length)
+        throw new Error('Output validation failed: stream count changed.');
+    before.forEach(function (stream, index) {
+        var _a, _b;
+        var result = after[index];
+        var fail = function (reason) {
+            throw new Error("Output validation failed for stream ".concat(index, ": ").concat(reason, "."));
+        };
+        ['codec_type', 'codec_name', 'width', 'height', 'pix_fmt', 'color_transfer', 'color_primaries', 'color_space']
+            .forEach(function (key) {
+            if (stream[key] !== undefined && stream[key] !== result[key])
+                fail("".concat(key, " changed"));
+        });
+        if (['video', 'audio', 'subtitle'].includes(stream.codec_type)) {
+            // FFprobe reports N/A for an empty track, such as a subtitle track without cues.
+            var originalCount = (_a = asNumber(stream.nb_read_packets)) !== null && _a !== void 0 ? _a : 0;
+            var resultCount = (_b = asNumber(result.nb_read_packets)) !== null && _b !== void 0 ? _b : 0;
+            if (stream.codec_type === 'video' && originalCount === 0)
+                fail('no input video packets');
+            if (originalCount !== resultCount)
+                fail("packet count changed (".concat(originalCount, " to ").concat(resultCount, ")"));
+        }
+        if (result.codec_type === 'video' && inspectVideo(result, index, []).hasDovi) {
+            fail('Dolby Vision signaling remains');
+        }
+    });
+    var beforeDuration = asNumber((_c = input.format) === null || _c === void 0 ? void 0 : _c.duration);
+    var afterDuration = asNumber((_d = output.format) === null || _d === void 0 ? void 0 : _d.duration);
+    if (!beforeDuration || !afterDuration || beforeDuration < 0 || afterDuration < 0) {
+        throw new Error('Output validation failed: cannot confirm input/output duration.');
+    }
+    // Allow small container rounding differences, never a percentage of a potentially very long movie.
+    if (Math.abs(beforeDuration - afterDuration) > 0.25) {
+        throw new Error("Output validation failed: duration changed (".concat(beforeDuration, "s to ").concat(afterDuration, "s)."));
+    }
+};
 var plugin = function (args) { return __awaiter(void 0, void 0, void 0, function () {
-    var lib, inputs, unchanged, streams, mediaTracks, videos, unsupported, ffmpegPath, run, capabilities, filters, needed, filename, outputFilePath, cliArgs, output;
-    var _a, _b, _c, _d, _e;
-    return __generator(this, function (_f) {
-        switch (_f.label) {
+    var lib, inputs, unchanged, streams, mediaTracks, inspectStreams, videos, unsupported, ffmpegPath, ffprobePath, run, probe, capabilities, filters, needed, source, filename, outputFilePath, cliArgs, output, _a, _b;
+    var _c, _d, _e, _f, _g, _h, _j;
+    return __generator(this, function (_k) {
+        switch (_k.label) {
             case 0:
                 lib = require('../../../../../methods/lib')();
                 inputs = lib.loadDefaultValues(args.inputs, details);
@@ -161,12 +212,13 @@ var plugin = function (args) { return __awaiter(void 0, void 0, void 0, function
                     outputNumber: outputNumber,
                     variables: args.variables,
                 }); };
-                streams = (_a = args.inputFileObj.ffProbeData) === null || _a === void 0 ? void 0 : _a.streams;
+                streams = (_c = args.inputFileObj.ffProbeData) === null || _c === void 0 ? void 0 : _c.streams;
                 if (!Array.isArray(streams) || streams.length === 0) {
                     throw new Error('Remove Dolby Vision requires FFprobe stream data. Rescan the file first.');
                 }
-                mediaTracks = (_c = (_b = args.inputFileObj.mediaInfo) === null || _b === void 0 ? void 0 : _b.track) !== null && _c !== void 0 ? _c : [];
-                videos = streams.map(function (stream, outputIndex) { return inspectVideo(stream, outputIndex, mediaTracks.filter(isMetadata)); }).filter(function (video) { return video.stream.codec_type === 'video' && video.hasDovi; });
+                mediaTracks = (_e = (_d = args.inputFileObj.mediaInfo) === null || _d === void 0 ? void 0 : _d.track) !== null && _e !== void 0 ? _e : [];
+                inspectStreams = function (items) { return items.map(function (stream, outputIndex) { return inspectVideo(stream, outputIndex, mediaTracks.filter(isMetadata)); }).filter(function (video) { return video.stream.codec_type === 'video' && video.hasDovi; }); };
+                videos = inspectStreams(streams);
                 if (videos.length === 0) {
                     args.jobLog('No Dolby Vision detected. Leaving the file unchanged.');
                     return [2 /*return*/, unchanged(2)];
@@ -177,25 +229,31 @@ var plugin = function (args) { return __awaiter(void 0, void 0, void 0, function
                     args.jobLog('Leaving the whole file unchanged; routing to output 3.');
                     return [2 /*return*/, unchanged(3)];
                 }
-                if ((_d = args.variables.ffmpegCommand) === null || _d === void 0 ? void 0 : _d.init) {
+                if ((_f = args.variables.ffmpegCommand) === null || _f === void 0 ? void 0 : _f.init) {
                     throw new Error('Place Remove Dolby Vision outside Begin Command / Execute blocks.');
                 }
-                ffmpegPath = String((_e = inputs.ffmpegPath) !== null && _e !== void 0 ? _e : '').trim() || args.ffmpegPath;
+                ffmpegPath = String((_g = inputs.ffmpegPath) !== null && _g !== void 0 ? _g : '').trim() || args.ffmpegPath;
                 if (!ffmpegPath)
                     throw new Error('No FFmpeg executable configured.');
+                ffprobePath = String((_h = inputs.ffprobePath) !== null && _h !== void 0 ? _h : '').trim()
+                    || path_1.default.join(path_1.default.dirname(ffmpegPath), path_1.default.basename(ffmpegPath).replace(/ffmpeg/i, 'ffprobe'));
+                if (ffprobePath === ffmpegPath) {
+                    throw new Error('Cannot infer FFprobe executable from FFmpeg Path. Set the FFprobe Path input.');
+                }
                 run = function (spawnArgs_1) {
                     var args_1 = [];
                     for (var _i = 1; _i < arguments.length; _i++) {
                         args_1[_i - 1] = arguments[_i];
                     }
-                    return __awaiter(void 0, __spreadArray([spawnArgs_1], args_1, true), void 0, function (spawnArgs, outputFilePath) {
-                        var cli, result;
+                    return __awaiter(void 0, __spreadArray([spawnArgs_1], args_1, true), void 0, function (spawnArgs, outputFilePath, executable) {
+                        var cli, result, tool;
                         if (outputFilePath === void 0) { outputFilePath = ''; }
+                        if (executable === void 0) { executable = ffmpegPath; }
                         return __generator(this, function (_a) {
                             switch (_a.label) {
                                 case 0:
                                     cli = new cliUtils_1.CLI({
-                                        cli: ffmpegPath,
+                                        cli: executable,
                                         spawnArgs: spawnArgs,
                                         spawnOpts: {},
                                         jobLog: args.jobLog,
@@ -209,7 +267,8 @@ var plugin = function (args) { return __awaiter(void 0, void 0, void 0, function
                                 case 1:
                                     result = _a.sent();
                                     if (cli.cancelled || result.cliExitCode !== 0) {
-                                        throw new Error("Remove Dolby Vision: FFmpeg failed or was cancelled (exit ".concat(result.cliExitCode, ").")
+                                        tool = executable === ffmpegPath ? 'FFmpeg' : 'FFprobe (check FFprobe Path)';
+                                        throw new Error("Remove Dolby Vision: ".concat(tool, " failed or was cancelled (exit ").concat(result.cliExitCode, ").")
                                             + ' See the job log. The source file has not been replaced.');
                                     }
                                     return [2 /*return*/, result];
@@ -217,9 +276,34 @@ var plugin = function (args) { return __awaiter(void 0, void 0, void 0, function
                         });
                     });
                 };
+                probe = function (file) { return __awaiter(void 0, void 0, void 0, function () {
+                    var result, data;
+                    return __generator(this, function (_a) {
+                        switch (_a.label) {
+                            case 0: return [4 /*yield*/, run([
+                                    '-v', 'error', '-count_packets', '-show_streams', '-show_format', '-of', 'json', file,
+                                ], '', ffprobePath)];
+                            case 1:
+                                result = _a.sent();
+                                try {
+                                    // CLI collects both stdout and stderr. At log level error, anything outside the JSON is
+                                    // a read/parse error (even with exit 0), and must fail validation rather than be discarded.
+                                    data = JSON.parse(result.errorLogFull.join(''));
+                                }
+                                catch (_) {
+                                    throw new Error('FFprobe validation failed: unreadable media or errors during the full packet scan.'
+                                        + ' See the job log.');
+                                }
+                                if (!data || !Array.isArray(data.streams) || data.streams.length === 0) {
+                                    throw new Error('FFprobe validation failed: no stream data returned.');
+                                }
+                                return [2 /*return*/, data];
+                        }
+                    });
+                }); };
                 return [4 /*yield*/, run(['-hide_banner', '-bsfs'])];
             case 1:
-                capabilities = _f.sent();
+                capabilities = _k.sent();
                 filters = capabilities.errorLogFull.join('').split(/\s+/);
                 needed = ['dovi_rpu'];
                 if (videos.some(function (video) { return video.stream.codec_name === 'hevc'; }))
@@ -227,6 +311,17 @@ var plugin = function (args) { return __awaiter(void 0, void 0, void 0, function
                 if (needed.some(function (filter) { return !filters.includes(filter); })) {
                     throw new Error("FFmpeg needs these bitstream filters: ".concat(needed.join(', '), ".")
                         + ' Configure FFmpeg 7.1+ using this plugin\'s FFmpeg Path input or the node settings.');
+                }
+                args.jobLog('Scanning every input packet before removing Dolby Vision.');
+                return [4 /*yield*/, probe(args.inputFileObj._id)];
+            case 2:
+                source = _k.sent();
+                streams = (_j = source.streams) !== null && _j !== void 0 ? _j : [];
+                videos = inspectStreams(streams);
+                if (videos.length === 0 || videos.some(function (video) { return !video.hdr; })) {
+                    args.jobLog('Fresh FFprobe data does not confirm the expected compatible Dolby Vision tracks.'
+                        + ' Rescan the file; leaving it unchanged and routing to output 3.');
+                    return [2 /*return*/, unchanged(3)];
                 }
                 filename = path_1.default.basename(args.inputFileObj._id.replace(/\\/g, '/'));
                 if (!path_1.default.extname(filename))
@@ -236,7 +331,7 @@ var plugin = function (args) { return __awaiter(void 0, void 0, void 0, function
                     throw new Error('The output path must differ from the input path.');
                 }
                 cliArgs = [
-                    '-hide_banner', '-nostdin', '-n', '-i', args.inputFileObj._id,
+                    '-hide_banner', '-nostdin', '-n', '-xerror', '-i', args.inputFileObj._id,
                     '-map', '0', '-map_metadata', '0', '-map_chapters', '0', '-c', 'copy',
                 ];
                 videos.forEach(function (video) {
@@ -269,14 +364,20 @@ var plugin = function (args) { return __awaiter(void 0, void 0, void 0, function
                 cliArgs.push(outputFilePath);
                 args.updateWorker({ CLIType: ffmpegPath, preset: cliArgs.join(' ') });
                 return [4 /*yield*/, run(cliArgs, outputFilePath)];
-            case 2:
-                _f.sent();
-                return [4 /*yield*/, fs_1.promises.stat(outputFilePath)];
             case 3:
-                output = _f.sent();
+                _k.sent();
+                return [4 /*yield*/, fs_1.promises.stat(outputFilePath)];
+            case 4:
+                output = _k.sent();
                 if (!output.isFile() || output.size === 0) {
                     throw new Error('FFmpeg did not produce a non-empty output file.');
                 }
+                args.jobLog('Scanning every output packet and checking stream, HDR color, packet count and duration preservation.');
+                _a = validateOutput;
+                _b = [source];
+                return [4 /*yield*/, probe(outputFilePath)];
+            case 5:
+                _a.apply(void 0, _b.concat([_k.sent()]));
                 args.logOutcome('tSuc');
                 return [2 /*return*/, {
                         outputFileObj: { _id: outputFilePath },

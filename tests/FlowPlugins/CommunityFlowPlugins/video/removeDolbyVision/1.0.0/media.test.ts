@@ -4,6 +4,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { plugin } from
   '../../../../../../FlowPluginsTs/CommunityFlowPlugins/video/removeDolbyVision/1.0.0/index';
+import * as cliUtils from '../../../../../../FlowPluginsTs/FlowHelpers/1.0.0/cliUtils';
 import { IpluginInputArgs } from '../../../../../../FlowPluginsTs/FlowHelpers/1.0.0/interfaces/interfaces';
 
 // Opt in with real FFmpeg/FFprobe binaries; ordinary unit tests do not download or require media tools.
@@ -18,8 +19,8 @@ const exec = (binary: string, cliArgs: string[]): Buffer => execFileSync(binary,
 const probe = (file: string, options: string[] = []) => JSON.parse(exec(ffprobe, [
   '-v', 'error', '-of', 'json', ...options, file,
 ]).toString());
-const rawVideo = (file: string, codec: string): Buffer => exec(ffmpeg, [
-  '-v', 'error', '-i', file, '-map', '0:v:0', '-c', 'copy',
+const rawVideo = (file: string, codec: string, stream = 'v:0'): Buffer => exec(ffmpeg, [
+  '-v', 'error', '-i', file, '-map', `0:${stream}`, '-c', 'copy',
   ...(codec === 'hevc' ? ['-bsf:v', 'hevc_mp4toannexb'] : []),
   '-f', codec === 'hevc' ? 'hevc' : 'obu', 'pipe:1',
 ]);
@@ -57,17 +58,47 @@ const av1Units = (raw: Buffer): { type: number, data: string, dolby: boolean }[]
   return result;
 };
 
+const frameMetadata = (file: string, stream = 'v:0') => probe(file, [
+  '-select_streams', stream, '-show_frames', '-show_entries', 'frame=side_data_list',
+]).frames.map((frame: { side_data_list?: { side_data_type: string }[] }) => (
+  frame.side_data_list?.filter((data) => /HDR10\+|Mastering display|Content light/.test(data.side_data_type)) || []
+));
+
+const expectPreservedVideo = (input: string, output: string, codec: string, stream = 'v:0') => {
+  const before = rawVideo(input, codec, stream);
+  const after = rawVideo(output, codec, stream);
+  if (codec === 'hevc') {
+    const inputUnits = hevcUnits(before);
+    const outputUnits = hevcUnits(after);
+    expect(inputUnits.some((nal) => nal.type === 62)).toBe(true);
+    expect(outputUnits.some((nal) => [62, 63].includes(nal.type))).toBe(false);
+    // Compare every encoded picture and every SEI payload, including HDR10+ and static HDR metadata.
+    const retain = (nal: { type: number }) => nal.type < 32 || [39, 40].includes(nal.type);
+    expect(outputUnits.filter(retain)).toEqual(inputUnits.filter(retain));
+  } else {
+    const inputUnits = av1Units(before);
+    const outputUnits = av1Units(after);
+    expect(inputUnits.some((obu) => obu.dolby)).toBe(true);
+    expect(outputUnits.some((obu) => obu.dolby)).toBe(false);
+    expect(outputUnits).toEqual(inputUnits.filter((obu) => !obu.dolby));
+  }
+  expect(frameMetadata(output, stream)).toEqual(frameMetadata(input, stream));
+};
+
 describeMedia('Remove Dolby Vision with real media', () => {
   let workDir: string;
   beforeEach(() => { workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tdarr-dovi-test-')); });
-  afterEach(() => { fs.rmSync(workDir, { recursive: true, force: true }); });
+  afterEach(() => {
+    jest.restoreAllMocks();
+    fs.rmSync(workDir, { recursive: true, force: true });
+  });
 
   const makeArgs = (file: string): IpluginInputArgs => ({
     inputFileObj: {
       _id: file,
       ffProbeData: probe(file, ['-show_streams', '-show_format']),
     },
-    inputs: {},
+    inputs: { ffprobePath: ffprobe },
     variables: { user: {}, ffmpegCommand: { init: false } },
     workDir,
     ffmpegPath: ffmpeg,
@@ -99,48 +130,158 @@ describeMedia('Remove Dolby Vision with real media', () => {
       codec_name: codec, color_transfer: 'smpte2084', color_primaries: 'bt2020', color_space: 'bt2020nc',
     }));
     expect(JSON.stringify(outputInfo)).not.toMatch(/DOVI configuration record/);
-    const before = rawVideo(input, String(codec));
-    const after = rawVideo(output, String(codec));
-    if (codec === 'hevc') {
-      const inputUnits = hevcUnits(before);
-      const outputUnits = hevcUnits(after);
-      expect(inputUnits.some((nal) => nal.type === 62)).toBe(true);
-      if (profile === 7) expect(inputUnits.some((nal) => nal.type === 63)).toBe(true);
-      expect(outputUnits.some((nal) => [62, 63].includes(nal.type))).toBe(false);
-      // Compare every encoded picture and every SEI payload, including HDR10+ and static HDR metadata.
-      const retain = (nal: { type: number }) => nal.type < 32 || [39, 40].includes(nal.type);
-      expect(outputUnits.filter(retain)).toEqual(inputUnits.filter(retain));
-    } else {
-      const inputUnits = av1Units(before);
-      const outputUnits = av1Units(after);
-      expect(inputUnits.some((obu) => obu.dolby)).toBe(true);
-      expect(outputUnits.some((obu) => obu.dolby)).toBe(false);
-      expect(outputUnits).toEqual(inputUnits.filter((obu) => !obu.dolby));
+    if (profile === 7) {
+      expect(hevcUnits(rawVideo(input, 'hevc')).some((nal) => nal.type === 63)).toBe(true);
     }
-    const frameMetadata = (file: string) => probe(file, [
-      '-select_streams', 'v:0', '-show_frames', '-show_entries', 'frame=side_data_list',
-    ]).frames.map((frame: { side_data_list?: { side_data_type: string }[] }) => (
-      frame.side_data_list?.filter((data) => /HDR10\+|Mastering display|Content light/.test(data.side_data_type)) || []
-    ));
-    const inputHdr = frameMetadata(input);
-    if (String(fixture).includes('hdr10plus')) expect(JSON.stringify(inputHdr)).toContain('HDR10+');
-    expect(frameMetadata(output)).toEqual(inputHdr);
+    expectPreservedVideo(input, output, String(codec));
+    if (String(fixture).includes('hdr10plus')) expect(JSON.stringify(frameMetadata(input))).toContain('HDR10+');
     expect(fs.readFileSync(input)).toEqual(original);
     expect((await plugin(makeArgs(output))).outputNumber).toBe(2);
   });
 
-  it('removes Dolby Vision from MP4 container signaling and video data', async () => {
+  it.each([['hevc', 'hvc1'], ['av1', 'av01']])('preserves HDR10+ when stripping %s in MP4', async (codec, tag) => {
     const input = path.join(workDir, 'Movie [DV] $literal.mp4');
     exec(ffmpeg, [
-      '-v', 'error', '-i', path.join(fixtures, 'hevc-hdr10plus.mkv'),
+      '-v', 'error', '-i', path.join(fixtures, `${codec}-hdr10plus.mkv`),
       '-map', '0', '-c', 'copy', '-strict', 'unofficial', input,
     ]);
     const result = await plugin(makeArgs(input));
+    expect(result.outputNumber).toBe(1);
     const output = result.outputFileObj._id;
     const info = probe(output, ['-show_streams']);
-    expect(info.streams[0].codec_tag_string).toBe('hvc1');
+    expect(info.streams[0].codec_tag_string).toBe(tag);
     expect(JSON.stringify(info)).not.toMatch(/DOVI configuration record/);
-    expect(hevcUnits(rawVideo(output, 'hevc')).some((nal) => [62, 63].includes(nal.type))).toBe(false);
+    expect(JSON.stringify(frameMetadata(input))).toContain('HDR10+');
+    expectPreservedVideo(input, output, codec);
+  });
+
+  it('routes a profile 5 MP4 with actual RPU payloads to output 3 without modifying it', async () => {
+    const input = path.join(fixtures, 'hevc-profile5.mp4');
+    const original = fs.readFileSync(input);
+    const args = makeArgs(input);
+    expect(args.inputFileObj.ffProbeData.streams?.[0].side_data_list).toEqual(expect.arrayContaining([
+      expect.objectContaining({ dv_profile: 5, dv_bl_signal_compatibility_id: 0 }),
+    ]));
+    expect(hevcUnits(rawVideo(input, 'hevc')).filter((nal) => nal.type === 62)).toHaveLength(8);
+    const result = await plugin(args);
+    expect(result.outputNumber).toBe(3);
+    expect(result.outputFileObj).toBe(args.inputFileObj);
+    expect(fs.readFileSync(input)).toEqual(original);
+    expect(fs.readdirSync(workDir)).toEqual([]);
+    expect(args.logOutcome).not.toHaveBeenCalled();
+  });
+
+  it('preserves HLG and encoded pictures when removing profile 8.4 from MOV', async () => {
+    const input = path.join(fixtures, 'hevc-hlg.mov');
+    const original = fs.readFileSync(input);
+    const args = makeArgs(input);
+    expect(args.inputFileObj.ffProbeData.streams?.[0].side_data_list).toEqual(expect.arrayContaining([
+      expect.objectContaining({ dv_profile: 8, dv_bl_signal_compatibility_id: 4 }),
+    ]));
+    const result = await plugin(args);
+    expect(result.outputNumber).toBe(1);
+    const info = probe(result.outputFileObj._id, ['-show_streams']);
+    expect(info.streams[0]).toEqual(expect.objectContaining({
+      color_transfer: 'arib-std-b67', color_primaries: 'bt2020', color_space: 'bt2020nc', codec_tag_string: 'hvc1',
+    }));
+    expect(JSON.stringify(info)).not.toMatch(/DOVI configuration record/);
+    expectPreservedVideo(input, result.outputFileObj._id, 'hevc');
+    expect(fs.readFileSync(input)).toEqual(original);
+    expect((await plugin(makeArgs(result.outputFileObj._id))).outputNumber).toBe(2);
+  });
+
+  it('processes both HEVC and AV1 Dolby Vision tracks while preserving a third ordinary HDR track', async () => {
+    const input = path.join(workDir, 'multiple videos.mkv');
+    exec(ffmpeg, [
+      '-v', 'error', '-i', path.join(fixtures, 'hevc-hdr10plus.mkv'),
+      '-i', path.join(fixtures, 'av1-hdr10plus.mkv'),
+      '-map', '0:v', '-map', '1:v', '-map', '0:v', '-c', 'copy',
+      '-bsf:v:2', 'filter_units=remove_types=62|63,dovi_rpu=strip=1',
+      '-metadata:s:v:0', 'title=HEVC HDR10+', '-metadata:s:v:1', 'title=AV1 HDR10+',
+      '-metadata:s:v:2', 'title=Ordinary HDR10+', '-disposition:v:0', '0',
+      '-disposition:v:1', 'default', '-disposition:v:2', '0', input,
+    ]);
+    const original = fs.readFileSync(input);
+    const before = probe(input, ['-show_streams']);
+    expect(before.streams).toHaveLength(3);
+    expect(JSON.stringify(before.streams[2])).not.toContain('DOVI configuration record');
+    const result = await plugin(makeArgs(input));
+    expect(result.outputNumber).toBe(1);
+    const output = result.outputFileObj._id;
+    const after = probe(output, ['-show_streams']);
+    expect(after.streams).toHaveLength(3);
+    expect(JSON.stringify(after)).not.toContain('DOVI configuration record');
+    before.streams.forEach((stream: { tags: { title: string }, disposition: unknown }, index: number) => {
+      expect(after.streams[index].tags.title).toBe(stream.tags.title);
+      expect(after.streams[index].disposition).toEqual(stream.disposition);
+      expect(JSON.stringify(frameMetadata(input, `v:${index}`))).toContain('HDR10+');
+      expect(frameMetadata(output, `v:${index}`)).toEqual(frameMetadata(input, `v:${index}`));
+    });
+    expectPreservedVideo(input, output, 'hevc', 'v:0');
+    expectPreservedVideo(input, output, 'av1', 'v:1');
+    expect(rawVideo(output, 'hevc', 'v:2')).toEqual(rawVideo(input, 'hevc', 'v:2'));
+    expect(fs.readFileSync(input)).toEqual(original);
+  });
+
+  it('leaves an entire mixed-profile file unchanged when one track is Dolby Vision-only', async () => {
+    const input = path.join(fixtures, 'hevc-mixed-profiles.mkv');
+    const original = fs.readFileSync(input);
+    const args = makeArgs(input);
+    expect(args.inputFileObj.ffProbeData.streams?.[0].side_data_list).toEqual(expect.arrayContaining([
+      expect.objectContaining({ dv_profile: 8, dv_bl_signal_compatibility_id: 1 }),
+    ]));
+    expect(args.inputFileObj.ffProbeData.streams?.[1].side_data_list).toEqual(expect.arrayContaining([
+      expect.objectContaining({ dv_profile: 5, dv_bl_signal_compatibility_id: 0 }),
+    ]));
+    const result = await plugin(args);
+    expect(result.outputNumber).toBe(3);
+    expect(result.outputFileObj).toBe(args.inputFileObj);
+    expect(fs.readFileSync(input)).toEqual(original);
+    expect(fs.readdirSync(workDir)).toEqual([]);
+    expect(args.logOutcome).not.toHaveBeenCalled();
+  });
+
+  it('rejects a truncated source whose container still advertises the original duration', async () => {
+    const input = path.join(workDir, 'truncated.mkv');
+    const fixture = fs.readFileSync(path.join(fixtures, 'hevc-hdr10plus.mkv'));
+    const truncated = fixture.subarray(0, Math.floor(fixture.length / 2));
+    fs.writeFileSync(input, truncated);
+    const args = makeArgs(input);
+    expect(Number(args.inputFileObj.ffProbeData.format?.duration)).toBeGreaterThan(10);
+    await expect(plugin(args)).rejects.toThrow('FFprobe validation failed');
+    expect(args.logOutcome).not.toHaveBeenCalled();
+    expect(fs.readFileSync(input)).toEqual(truncated);
+    expect(fs.readdirSync(workDir)).toEqual(['truncated.mkv']);
+  });
+
+  it('rejects a shortened remux even when FFmpeg exits zero and the output is playable', async () => {
+    const input = path.join(fixtures, 'hevc-hdr10plus.mkv');
+    const original = fs.readFileSync(input);
+    const ActualCLI = cliUtils.CLI;
+    let remuxExit: number | undefined;
+    let output = '';
+    jest.spyOn(cliUtils, 'CLI').mockImplementation((config) => {
+      const cli = new ActualCLI(config);
+      const run = cli.runCli;
+      const remuxing = config.spawnArgs.includes('-i');
+      if (remuxing) {
+        output = config.outputFilePath;
+        config.spawnArgs.splice(config.spawnArgs.length - 1, 0, '-t', '5');
+      }
+      cli.runCli = async () => {
+        const result = await run();
+        if (remuxing) remuxExit = result.cliExitCode;
+        return result;
+      };
+      return cli;
+    });
+    const args = makeArgs(input);
+    await expect(plugin(args)).rejects.toThrow('packet count changed');
+    expect(remuxExit).toBe(0);
+    expect(fs.statSync(output).size).toBeGreaterThan(0);
+    expect(Number(probe(output, ['-show_format']).format.duration)).toBeLessThan(6);
+    expect(args.logOutcome).not.toHaveBeenCalled();
+    expect(fs.readFileSync(input)).toEqual(original);
   });
 
   it('retains audio, subtitles, attachments, chapters, metadata, dispositions and packet timing', async () => {

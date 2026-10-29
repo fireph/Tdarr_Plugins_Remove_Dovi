@@ -1,0 +1,55 @@
+name: Remove Dolby Vision media tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/remove_dolby_vision_media.yml'
+      - 'FlowPluginsTs/CommunityFlowPlugins/video/removeDolbyVision/**'
+      - 'FlowPlugins/CommunityFlowPlugins/video/removeDolbyVision/**'
+      - 'FlowPluginsTs/FlowHelpers/**'
+      - 'tests/FlowPlugins/CommunityFlowPlugins/video/removeDolbyVision/**'
+      - 'tests/sampleData/media/dolbyVision/**'
+      - 'package*.json'
+  pull_request:
+    paths:
+      - '.github/workflows/remove_dolby_vision_media.yml'
+      - 'FlowPluginsTs/CommunityFlowPlugins/video/removeDolbyVision/**'
+      - 'FlowPlugins/CommunityFlowPlugins/video/removeDolbyVision/**'
+      - 'FlowPluginsTs/FlowHelpers/**'
+      - 'tests/FlowPlugins/CommunityFlowPlugins/video/removeDolbyVision/**'
+      - 'tests/sampleData/media/dolbyVision/**'
+      - 'package*.json'
+
+permissions:
+  contents: read
+
+jobs:
+  jellyfin_ffmpeg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      TDARR_TEST_FFMPEG: /usr/lib/jellyfin-ffmpeg/ffmpeg
+      TDARR_TEST_FFPROBE: /usr/lib/jellyfin-ffmpeg/ffprobe
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@3235b876344d2a9aa001b8d1453c930bba69e610 # v3
+        with:
+          node-version: '22.x'
+          cache: npm
+      - run: npm ci
+      - name: Install the FFmpeg build used by Tdarr (verified 2026-10-28)
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/jellyfin/jellyfin-ffmpeg/releases/download/v7.1.4-3/jellyfin-ffmpeg7_7.1.4-3-noble_amd64.deb \
+            --output "$RUNNER_TEMP/jellyfin-ffmpeg7.deb"
+          echo "bbaa1a5fea4fe0a23df1bfd9050af6a4a5f7fc934ebbca997d687e528a0931a6  $RUNNER_TEMP/jellyfin-ffmpeg7.deb" | sha256sum --check
+          sudo apt-get update
+          sudo apt-get install --yes "$RUNNER_TEMP/jellyfin-ffmpeg7.deb"
+          "$TDARR_TEST_FFMPEG" -version
+          "$TDARR_TEST_FFPROBE" -version
+      - name: Check types and run unit and media tests
+        run: |
+          npx tsc --noEmit
+          npm run test:flows -- --runInBand removeDolbyVision
