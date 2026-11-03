@@ -99,7 +99,8 @@ const inspectVideo = (stream: Istreams, outputIndex: number, tracks: Metadata[])
       hdr = 'HDR10';
     } else if ((stream.codec_name === 'hevc' && profile === 8)
       || (stream.codec_name === 'av1' && profile === 10)) {
-      if (compatibility === 1) hdr = 'HDR10';
+      // HEVC hybrids can retain the Blu-ray HDR base compatibility ID after conversion to profile 8.
+      if (compatibility === 1 || (stream.codec_name === 'hevc' && compatibility === 6)) hdr = 'HDR10';
       if (compatibility === 4) hdr = 'HLG';
       // MediaInfo is a fallback only. Never override an explicit incompatible configuration record.
       if (!config && /\bHDR10\+?(?:\s+compatible)?\b/i.test(hdrFormat)) hdr = 'HDR10';

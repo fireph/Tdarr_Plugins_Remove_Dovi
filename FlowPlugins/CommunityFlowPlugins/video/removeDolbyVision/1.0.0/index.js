@@ -134,7 +134,8 @@ var inspectVideo = function (stream, outputIndex, tracks) {
         }
         else if ((stream.codec_name === 'hevc' && profile === 8)
             || (stream.codec_name === 'av1' && profile === 10)) {
-            if (compatibility === 1)
+            // HEVC hybrids can retain the Blu-ray HDR base compatibility ID after conversion to profile 8.
+            if (compatibility === 1 || (stream.codec_name === 'hevc' && compatibility === 6))
                 hdr = 'HDR10';
             if (compatibility === 4)
                 hdr = 'HLG';

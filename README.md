@@ -51,6 +51,7 @@ flow with an error instead of returning a file on output 1.
 | --- | --- |
 | HEVC profile 7, MEL or FEL, in a single video track | HDR10, including HDR10+ when present |
 | HEVC profile 8 with compatibility ID 1 (8.1) | HDR10, including HDR10+ when present |
+| HEVC profile 8 with compatibility ID 6 (Blu-ray HDR base) | HDR10, including HDR10+ when present |
 | HEVC profile 8 with compatibility ID 4 (8.4) | HLG |
 | AV1 profile 10 with compatibility ID 1 | HDR10, including HDR10+ when present |
 | AV1 profile 10 with compatibility ID 4 | HLG |
